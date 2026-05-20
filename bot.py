@@ -312,6 +312,52 @@ class PiDiscordBot(discord.Client):
                         logger.info(f"Pi response: {len(full_response)} chars")
                     else:
                         logger.info(f"Pi returned empty response (model may have only produced thinking blocks)")
+
+                    # ── Auto-continue: keep agent working until task is done ──
+                    max_continue = 3
+                    continue_count = 0
+                    while continue_count < max_continue:
+                        text = full_response or ""
+                        last_200 = text[-200:] if len(text) > 200 else text
+                        needs_continue = False
+
+                        # Check for incomplete patterns
+                        for kw in ["Let me", "I'll", "Now I", "I will", "Next,", "Next step",
+                                   "Continuing", "To finish", "Finally,", "Moving on",
+                                   "I should", "I need to", "Let's", "We need to",
+                                   "The next", "After that", "Once that", "Then I'll",
+                                   "I'm going to", "I plan to", "I'd like to"]:
+                            if kw in last_200:
+                                needs_continue = True
+                                break
+
+                        # Check if tool notifications show writes but no completion
+                        if not needs_continue and tool_notifications:
+                            recent = tool_notifications[-3:]
+                            has_write = any("write" in t or "edit" in t for t in recent)
+                            has_done = any(kw in text.lower()[-500:] for kw in ["done", "complete", "finished", "wrote", "created", "updated"])
+                            if has_write and not has_done:
+                                needs_continue = True
+
+                        if not needs_continue:
+                            break
+
+                        continue_count += 1
+                        logger.info(f"Auto-continue #{continue_count}: sending follow-up")
+
+                        def run_continue():
+                            return pi.prompt_sync(
+                                "Continue and finish the task completely. Keep working until it's fully done.",
+                                timeout=300, on_delta=on_delta, on_tool=on_tool_start,
+                            )
+
+                        extra = await loop.run_in_executor(None, run_continue)
+                        if extra:
+                            full_response += "\n\n---\n\n" + extra
+                            logger.info(f"Auto-continue #{continue_count}: +{len(extra)} chars")
+                        else:
+                            break
+
                 except Exception as e:
                     logger.error(f"Pi error: {e}")
                     await channel.send(f"❌ Error: {e}")
