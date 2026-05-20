@@ -19,7 +19,7 @@ Discord ──► Python Discord Bot ──► pi --mode rpc (subprocess per cha
 - **Auto-cleanup** — Idle sessions auto-terminated after 30 minutes
 - **Access control** — Restrict by guild, channel, and user ID
 - **Streaming responses** — See pi's output in real-time
-- **Image support** — Vision models can describe images; metadata fallback for others
+- **Screenshots** — `!screenshot <url>` captures any webpage and sends the image to Discord
 - **Model switching** — Switch pi models directly from Discord (`!model`)
 - **TUI Manager** — Terminal UI to start, stop, monitor, and manage the bot
 - **Single-instance lock** — Prevents multiple bot processes from running
@@ -167,8 +167,11 @@ sudo bash pi-discord-manager.sh autostart
 | Command | Description |
 |---------|-------------|
 | `!help` | Show all commands |
+| `!screenshot <url>` | Take a webpage screenshot (alias: `!ss`) |
 | `!model` | List available pi models |
 | `!model <name>` | Switch to a specific model (e.g., `!model kimi-k2.5`) |
+| `!cd <path>` | Set working directory for this session |
+| `!pwd` | Show current working directory |
 | `!sessions` | List active pi sessions |
 | `!session-kill <id>` | Remove a specific session |
 | `!new` | Reset session context in this thread |
