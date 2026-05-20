@@ -18,9 +18,9 @@ logger = logging.getLogger("session_manager")
 class PiSession:
     """Wrapper around a PiRpcClient with per-session metadata."""
 
-    def __init__(self, session_id: str, pi_command: str = "pi"):
+    def __init__(self, session_id: str, pi_command: str = "pi", cwd: Optional[str] = None):
         self.session_id = session_id
-        self.client = PiRpcClient(pi_command=pi_command)
+        self.client = PiRpcClient(pi_command=pi_command, cwd=cwd)
         self.created_at = time.monotonic()
         self.last_used_at = time.monotonic()
         self.message_count = 0
@@ -82,9 +82,13 @@ class SessionManager:
             self._sessions.clear()
         logger.info("Session manager stopped")
 
-    def get_or_create(self, channel_id: str) -> PiSession:
+    def get_or_create(self, channel_id: str, cwd: Optional[str] = None) -> PiSession:
         """
         Get an existing session for a channel, or create a new one.
+        
+        Args:
+            channel_id: Discord channel/thread ID
+            cwd: Working directory for this session (None = bot's cwd)
         """
         with self._lock:
             if channel_id in self._sessions:
@@ -92,10 +96,11 @@ class SessionManager:
                 session.touch()
                 return session
 
-            logger.info(f"Creating new session for channel: {channel_id}")
+            logger.info(f"Creating new session for channel: {channel_id} (cwd={cwd})")
             session = PiSession(
                 session_id=channel_id,
                 pi_command=self.pi_command,
+                cwd=cwd,
             )
             session.start()
             session.touch()

@@ -62,6 +62,8 @@ class PiDiscordBot(discord.Client):
         )
         # Per-channel locks to prevent concurrent prompts to the same pi session
         self._channel_locks: dict[str, asyncio.Lock] = {}
+        # Per-channel working directories (like "cd" for pi sessions)
+        self._channel_cwds: dict[str, str] = {}
 
     # ── Lifecycle ─────────────────────────────
 
@@ -172,6 +174,9 @@ class PiDiscordBot(discord.Client):
             "sessions": self._cmd_sessions,
             "session-kill": self._cmd_session_kill,
             "sk": self._cmd_session_kill,
+            "cd": self._cmd_cd,
+            "pwd": self._cmd_pwd,
+            "cwd": self._cmd_pwd,
         }
 
         handler = handlers.get(cmd_name)
@@ -272,7 +277,9 @@ class PiDiscordBot(discord.Client):
                 prompt_text += "\n" + "\n".join(ref_lines)
 
             # ── Send to pi ──
-            session = self.session_manager.get_or_create(str(channel.id))
+            channel_id = str(channel.id)
+            cwd = self._channel_cwds.get(channel_id)
+            session = self.session_manager.get_or_create(channel_id, cwd=cwd)
             pi = session.client
 
             async with channel.typing():
@@ -397,6 +404,8 @@ class PiDiscordBot(discord.Client):
             value=(
                 f"`{p}help` — Show this message\n"
                 f"`{p}model` — List / switch models\n"
+                f"`{p}cd <path>` — Set working directory for this session\n"
+                f"`{p}pwd` — Show current working directory\n"
                 f"`{p}sessions` — List active sessions\n"
                 f"`{p}session-kill <id>` — Remove a session\n"
                 f"`{p}stats` — Show session stats\n"
@@ -527,13 +536,56 @@ class PiDiscordBot(discord.Client):
         await message.channel.send(f"✅ Removed session for channel `{channel_id}`.")
         logger.info(f"Session killed by user: {channel_id}")
 
+    async def _cmd_cd(self, message: discord.Message, args: str):
+        """Set the working directory for this session (like 'cd' in terminal).
+        
+        This restarts the pi session so pi operates in the given project directory.
+        Pi's tools (read, write, bash) will work relative to this directory.
+        
+        Usage: !cd /path/to/project
+               !cd .    (reset to bot directory)
+               !cd ~    (go home)
+        """
+        if not args:
+            current = self._channel_cwds.get(str(message.channel.id), os.getcwd())
+            await message.channel.send(f"📂 Current working directory: `{current}`")
+            return
+
+        # Resolve the path
+        expanded = os.path.expanduser(args)
+        if not os.path.isabs(expanded):
+            # Relative to current cwd or bot directory
+            base = self._channel_cwds.get(str(message.channel.id), os.getcwd())
+            expanded = os.path.abspath(os.path.join(base, expanded))
+
+        if not os.path.isdir(expanded):
+            await message.channel.send(f"❌ Directory not found: `{expanded}`")
+            return
+
+        channel_id = str(message.channel.id)
+        self._channel_cwds[channel_id] = expanded
+
+        # Kill existing session so it restarts with new cwd
+        self.session_manager.remove(channel_id)
+
+        await message.channel.send(f"📂 Working directory set to: `{expanded}`")
+        logger.info(f"Session cwd changed: {channel_id} -> {expanded}")
+
+    async def _cmd_pwd(self, message: discord.Message, args: str):
+        """Show the current working directory for this session."""
+        channel_id = str(message.channel.id)
+        cwd = self._channel_cwds.get(channel_id, os.getcwd())
+        await message.channel.send(f"📂 Working directory: `{cwd}`")
+
     async def _cmd_model(self, message: discord.Message, args: str):
         """List available models or switch to a specific one."""
         channel = message.channel
 
         # Get or create session
         try:
-            session = self.session_manager.get_or_create(str(channel.id))
+            channel_id = str(channel.id)
+            cwd = self._channel_cwds.get(channel_id)
+            session = self.session_manager.get_or_create(channel_id, cwd=cwd)
             pi = session.client
         except Exception as e:
             await channel.send(f"❌ Error: {e}")

@@ -100,10 +100,12 @@ class PiRpcClient:
         pi_command: str = "pi",
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
+        cwd: Optional[str] = None,
     ):
         self.pi_command = pi_command
         self.extra_args = extra_args or []
         self.env = {**os.environ, **(env or {})}
+        self.cwd = cwd
 
         self._process: Optional[subprocess.Popen] = None
         self._reader_thread: Optional[threading.Thread] = None
@@ -131,6 +133,7 @@ class PiRpcClient:
             text=True,
             bufsize=1,
             env=self.env,
+            cwd=self.cwd,
         )
 
         self._running = True
