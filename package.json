@@ -1,0 +1,35 @@
+{
+  "name": "pi-discord-bridge",
+  "version": "1.0.0",
+  "description": "Discord \u2194 pi Agent Bridge \u2014 Chat with pi coding agents through Discord threads",
+  "keywords": [
+    "pi-package",
+    "discord",
+    "bridge",
+    "rpc"
+  ],
+  "author": "",
+  "license": "MIT",
+  "pi": {
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ],
+    "video": "",
+    "image": ""
+  },
+  "piDisplay": {
+    "name": "Discord \u2194 pi Bridge",
+    "description": "Talk to pi coding agents through Discord threads. Each thread gets its own isolated pi session.",
+    "setup": "1. Install Python deps: pip install -r requirements.txt\n2. Create a Discord bot & get token\n3. Edit config.json or set DISCORD_BOT_TOKEN\n4. Run: python3 bot.py\n5. Or use: bash pi-discord-manager.sh",
+    "commands": {
+      "!model": "List/switch pi models",
+      "!sessions": "List active sessions",
+      "!session-kill": "Remove a session",
+      "!new": "Reset session context",
+      "!help": "Show all commands"
+    }
+  }
+}

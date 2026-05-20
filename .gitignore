@@ -1,0 +1,11 @@
+# Sensitive config (contains tokens)
+config.json
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# Temp files
+/tmp/
