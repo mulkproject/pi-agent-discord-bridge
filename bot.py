@@ -16,6 +16,7 @@ import os
 import tempfile
 import shutil
 import subprocess
+import time
 from typing import Optional
 
 import discord
@@ -177,6 +178,8 @@ class PiDiscordBot(discord.Client):
             "cd": self._cmd_cd,
             "pwd": self._cmd_pwd,
             "cwd": self._cmd_pwd,
+            "screenshot": self._cmd_screenshot,
+            "ss": self._cmd_screenshot,
         }
 
         handler = handlers.get(cmd_name)
@@ -254,6 +257,19 @@ class PiDiscordBot(discord.Client):
                             image_metadata.append(meta)
                             logger.info(f"RPC image added for pi: {att.filename} ({len(b64)} base64 chars)")
 
+            # Get channel cwd for system context
+            channel_id = str(channel.id)
+            cwd = self._channel_cwds.get(channel_id)
+
+            # Add system capabilities to prompt (so pi knows what tools are available)
+            screenshot_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshot.py")
+            prompt_text += (
+                "\n\n[System capabilities:]\n"
+                f"- Screenshots: Use `python3 {screenshot_script} <url>` via bash to take webpage screenshots.\n"
+                "  Screenshots will be automatically sent to the Discord user.\n"
+                f"- Working directory: {cwd or os.getcwd()}\n"
+            )
+
             # Append metadata to prompt text (for pi's context)
             if image_metadata:
                 prompt_text += "\n\n[Image metadata for attached images:]\n"
@@ -277,8 +293,6 @@ class PiDiscordBot(discord.Client):
                 prompt_text += "\n" + "\n".join(ref_lines)
 
             # ── Send to pi ──
-            channel_id = str(channel.id)
-            cwd = self._channel_cwds.get(channel_id)
             session = self.session_manager.get_or_create(channel_id, cwd=cwd)
             pi = session.client
 
@@ -363,8 +377,29 @@ class PiDiscordBot(discord.Client):
                     await channel.send(f"❌ Error: {e}")
                     return
 
+            # ── Check for screenshot files created by pi ──
+            screenshot_files = []
+            if temp_dir:
+                for fname in os.listdir(temp_dir):
+                    if fname.endswith(".png") and "screenshot" in fname.lower():
+                        fpath = os.path.join(temp_dir, fname)
+                        screenshot_files.append(fpath)
+            # Also check /tmp for recent pi screenshot files
+            for root, dirs, files in os.walk("/tmp"):
+                for fname in files:
+                    if fname.endswith(".png") and "screenshot" in fname.lower():
+                        fpath = os.path.join(root, fname)
+                        # Check if created in last 30 seconds
+                        age = time.time() - os.path.getctime(fpath)
+                        if age < 30:
+                            screenshot_files.append(fpath)
+                            break
+                if screenshot_files:
+                    break
+            screenshot_files = list(set(screenshot_files))[:3]  # Max 3
+
             # ── Send response ──
-            if not full_response and not tool_notifications:
+            if not full_response and not tool_notifications and not screenshot_files:
                 await channel.send("✅ Done (no output)")
                 return
 
@@ -386,6 +421,16 @@ class PiDiscordBot(discord.Client):
 
                 summary = "🔧 **Tools used:** " + ", ".join(summary_parts)
                 await channel.send(summary)
+
+            # Send screenshot files if pi created any
+            if screenshot_files:
+                for fpath in screenshot_files:
+                    try:
+                        fname = os.path.basename(fpath)
+                        await channel.send(file=discord.File(fpath, filename=fname))
+                        logger.info(f"Sent screenshot: {fpath}")
+                    except Exception as e:
+                        logger.error(f"Failed to send screenshot {fpath}: {e}")
 
             if full_response:
                 max_len = self.config.max_discord_message_length
@@ -464,8 +509,9 @@ class PiDiscordBot(discord.Client):
             name="Commands",
             value=(
                 f"`{p}help` — Show this message\n"
+                f"`{p}screenshot <url>` — Take a webpage screenshot\n"
                 f"`{p}model` — List / switch models\n"
-                f"`{p}cd <path>` — Set working directory for this session\n"
+                f"`{p}cd <path>` — Set working directory\n"
                 f"`{p}pwd` — Show current working directory\n"
                 f"`{p}sessions` — List active sessions\n"
                 f"`{p}session-kill <id>` — Remove a session\n"
@@ -638,14 +684,68 @@ class PiDiscordBot(discord.Client):
         cwd = self._channel_cwds.get(channel_id, os.getcwd())
         await message.channel.send(f"📂 Working directory: `{cwd}`")
 
+    async def _cmd_screenshot(self, message: discord.Message, args: str):
+        """Take a screenshot of a URL and send it to Discord.
+        
+        Usage: !screenshot https://example.com
+               !ss https://example.com
+        """
+        url = args.strip()
+        if not url:
+            await message.channel.send(
+                f"❌ Usage: `{self.config.bot_prefix}screenshot <url>`\n"
+                f"   Example: `{self.config.bot_prefix}screenshot https://example.com`"
+            )
+            return
+
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        await message.channel.send(f"📸 Taking screenshot of `{url}`...")
+
+        try:
+            from playwright.sync_api import sync_playwright
+
+            temp_dir = tempfile.mkdtemp(prefix="pi-screenshot-")
+            output_path = os.path.join(temp_dir, "screenshot.png")
+
+            def take_shot():
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    page = browser.new_page(viewport={"width": 1280, "height": 720})
+                    page.goto(url, wait_until="networkidle", timeout=30000)
+                    page.screenshot(path=output_path, full_page=False)
+                    browser.close()
+                return output_path
+
+            loop = asyncio.get_event_loop()
+            result_path = await loop.run_in_executor(None, take_shot)
+
+            if os.path.exists(result_path):
+                await message.channel.send(
+                    f"📸 Screenshot of `{url}`:",
+                    file=discord.File(result_path, "screenshot.png")
+                )
+                logger.info(f"Screenshot taken: {url} -> {result_path}")
+            else:
+                await message.channel.send("❌ Screenshot failed.")
+
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        except ImportError:
+            await message.channel.send(
+                "❌ Playwright is not installed. Run: pip install playwright && python3 -m playwright install chromium"
+            )
+        except Exception as e:
+            await message.channel.send(f"❌ Screenshot failed: {e}")
+            logger.error(f"Screenshot error: {e}")
+
     async def _cmd_model(self, message: discord.Message, args: str):
         """List available models or switch to a specific one."""
         channel = message.channel
 
         # Get or create session
         try:
-            channel_id = str(channel.id)
-            cwd = self._channel_cwds.get(channel_id)
             session = self.session_manager.get_or_create(channel_id, cwd=cwd)
             pi = session.client
         except Exception as e:
