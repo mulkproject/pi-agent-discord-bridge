@@ -9,3 +9,6 @@ venv/
 
 # Temp files
 /tmp/
+
+# Generated screenshots
+*.png
