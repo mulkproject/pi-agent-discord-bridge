@@ -60,6 +60,8 @@ class PiDiscordBot(discord.Client):
             max_idle_seconds=config.max_session_idle_minutes * 60,
             cleanup_interval=config.session_cleanup_interval_minutes * 60,
         )
+        # Per-channel locks to prevent concurrent prompts to the same pi session
+        self._channel_locks: dict[str, asyncio.Lock] = {}
 
     # ── Lifecycle ─────────────────────────────
 
@@ -101,6 +103,12 @@ class PiDiscordBot(discord.Client):
         if not self.config.admin_user_ids:
             return False
         return str(user_id) in [str(i) for i in self.config.admin_user_ids] if user_id else False
+
+    def _get_channel_lock(self, channel_id: str) -> asyncio.Lock:
+        """Get or create a per-channel asyncio lock to prevent concurrent prompts."""
+        if channel_id not in self._channel_locks:
+            self._channel_locks[channel_id] = asyncio.Lock()
+        return self._channel_locks[channel_id]
 
     # ── Message Handler ───────────────────────
 
@@ -178,7 +186,11 @@ class PiDiscordBot(discord.Client):
     # ── Prompt Handling ───────────────────────
 
     async def _handle_prompt(self, message: discord.Message):
-        """Send a user message to pi and return the response."""
+        """Send a user message to pi and return the response.
+        
+        Uses a per-channel lock to ensure prompts to the same pi session
+        are processed sequentially (prevents "Done (no output)" errors).
+        """
         channel = message.channel
         user = message.author
         prompt_text = message.content
@@ -186,136 +198,139 @@ class PiDiscordBot(discord.Client):
         guild_name = message.guild.name if message.guild else "DM"
         logger.info(f"Prompt from {user} in {channel.name} ({guild_name}): {prompt_text[:80]}...")
 
-        # ── Process attachments ────────────────
-        file_refs = []
-        rpc_images = []
-        temp_dir = None
-        image_metadata = []
+        # Acquire per-channel lock to prevent concurrent prompts
+        lock = self._get_channel_lock(str(channel.id))
+        async with lock:
+                # ── Process attachments ────────────────
+            file_refs = []
+            rpc_images = []
+            temp_dir = None
+            image_metadata = []
 
-        if message.attachments:
-            temp_dir = tempfile.mkdtemp(prefix="pi-discord-")
+            if message.attachments:
+                temp_dir = tempfile.mkdtemp(prefix="pi-discord-")
 
-            for att in message.attachments:
-                data = await att.read()
-                ext = os.path.splitext(att.filename)[1].lower()
-                is_image = ext in (".png", ".jpg", ".jpeg", ".gif", ".webp")
-                file_path = os.path.join(temp_dir, att.filename)
+                for att in message.attachments:
+                    data = await att.read()
+                    ext = os.path.splitext(att.filename)[1].lower()
+                    is_image = ext in (".png", ".jpg", ".jpeg", ".gif", ".webp")
+                    file_path = os.path.join(temp_dir, att.filename)
 
-                with open(file_path, "wb") as f:
-                    f.write(data)
+                    with open(file_path, "wb") as f:
+                        f.write(data)
 
-                file_refs.append({
-                    "path": file_path,
-                    "filename": att.filename,
-                    "size": len(data),
-                    "is_image": is_image,
-                })
-                logger.info(f"{'📷' if is_image else '📎'} Attachment: {att.filename} ({len(data)} bytes)")
-
-                # For images: add to RPC images AND extract local metadata
-                if is_image:
-                    import base64
-                    b64 = base64.b64encode(data).decode("utf-8")
-                    mime = {
-                        ".png": "image/png",
-                        ".jpg": "image/jpeg",
-                        ".jpeg": "image/jpeg",
-                        ".gif": "image/gif",
-                        ".webp": "image/webp",
-                    }.get(ext, "image/png")
-                    rpc_images.append({
-                        "type": "image",
-                        "data": b64,
-                        "mimeType": mime,
+                    file_refs.append({
+                        "path": file_path,
+                        "filename": att.filename,
+                        "size": len(data),
+                        "is_image": is_image,
                     })
-                    # Also extract metadata locally (fallback for non-vision models)
-                    meta = self._get_image_metadata(file_path, att.filename)
-                    if meta:
-                        image_metadata.append(meta)
-                        logger.info(f"RPC image added for pi: {att.filename} ({len(b64)} base64 chars)")
+                    logger.info(f"{'📷' if is_image else '📎'} Attachment: {att.filename} ({len(data)} bytes)")
 
-        # Append metadata to prompt text (for pi's context)
-        if image_metadata:
-            prompt_text += "\n\n[Image metadata for attached images:]\n"
-            for m in image_metadata:
-                # Extract just the metadata part, skip the decorative text
-                prompt_text += m + "\n"
+                    # For images: add to RPC images AND extract local metadata
+                    if is_image:
+                        import base64
+                        b64 = base64.b64encode(data).decode("utf-8")
+                        mime = {
+                            ".png": "image/png",
+                            ".jpg": "image/jpeg",
+                            ".jpeg": "image/jpeg",
+                            ".gif": "image/gif",
+                            ".webp": "image/webp",
+                        }.get(ext, "image/png")
+                        rpc_images.append({
+                            "type": "image",
+                            "data": b64,
+                            "mimeType": mime,
+                        })
+                        # Also extract metadata locally (fallback for non-vision models)
+                        meta = self._get_image_metadata(file_path, att.filename)
+                        if meta:
+                            image_metadata.append(meta)
+                            logger.info(f"RPC image added for pi: {att.filename} ({len(b64)} base64 chars)")
 
-        # Build prompt with file references (for models without vision)
-        if file_refs:
-            ref_lines = ["\n📎 **Attached files:**"]
-            for ref in file_refs:
-                icon = "📷" if ref["is_image"] else "📄"
-                ref_lines.append(f"- {icon} `{ref['path']}` ({ref['filename']}, {ref['size']} bytes)")
+            # Append metadata to prompt text (for pi's context)
+            if image_metadata:
+                prompt_text += "\n\n[Image metadata for attached images:]\n"
+                for m in image_metadata:
+                    # Extract just the metadata part, skip the decorative text
+                    prompt_text += m + "\n"
 
-            if any(r["is_image"] for r in file_refs):
-                ref_lines.append(
-                    "\nIf you can see attached images visually, describe them. "
-                    "Otherwise use `identify` or `file` for metadata."
-                )
+            # Build prompt with file references (for models without vision)
+            if file_refs:
+                ref_lines = ["\n📎 **Attached files:**"]
+                for ref in file_refs:
+                    icon = "📷" if ref["is_image"] else "📄"
+                    ref_lines.append(f"- {icon} `{ref['path']}` ({ref['filename']}, {ref['size']} bytes)")
 
-            prompt_text += "\n" + "\n".join(ref_lines)
+                if any(r["is_image"] for r in file_refs):
+                    ref_lines.append(
+                        "\nIf you can see attached images visually, describe them. "
+                        "Otherwise use `identify` or `file` for metadata."
+                    )
 
-        # ── Send to pi ──
-        session = self.session_manager.get_or_create(str(channel.id))
-        pi = session.client
+                prompt_text += "\n" + "\n".join(ref_lines)
 
-        async with channel.typing():
-            full_response = ""
-            tool_notifications = []
+            # ── Send to pi ──
+            session = self.session_manager.get_or_create(str(channel.id))
+            pi = session.client
 
-            def on_delta(delta: str):
-                nonlocal full_response
-                full_response += delta
+            async with channel.typing():
+                full_response = ""
+                tool_notifications = []
 
-            def on_tool_start(name: str, args: dict):
-                if self.config.show_tool_notifications:
-                    tool_notifications.append(f"🔧 Running `{name}`...")
+                def on_delta(delta: str):
+                    nonlocal full_response
+                    full_response += delta
 
-            loop = asyncio.get_event_loop()
+                def on_tool_start(name: str, args: dict):
+                    if self.config.show_tool_notifications:
+                        tool_notifications.append(f"🔧 Running `{name}`...")
 
-            def run_prompt():
-                return pi.prompt_sync(
-                    prompt_text,
-                    timeout=300,
-                    on_delta=on_delta,
-                    on_tool=on_tool_start,
-                    images=rpc_images or None,
-                )
+                loop = asyncio.get_event_loop()
 
-            try:
-                result_text = await loop.run_in_executor(None, run_prompt)
-                if result_text:
-                    full_response = result_text
-                    logger.info(f"Pi response: {len(full_response)} chars")
-                else:
-                    logger.info(f"Pi returned empty response (model may have only produced thinking blocks)")
-            except Exception as e:
-                logger.error(f"Pi error: {e}")
-                await channel.send(f"❌ Error: {e}")
+                def run_prompt():
+                    return pi.prompt_sync(
+                        prompt_text,
+                        timeout=300,
+                        on_delta=on_delta,
+                        on_tool=on_tool_start,
+                        images=rpc_images or None,
+                    )
+
+                try:
+                    result_text = await loop.run_in_executor(None, run_prompt)
+                    if result_text:
+                        full_response = result_text
+                        logger.info(f"Pi response: {len(full_response)} chars")
+                    else:
+                        logger.info(f"Pi returned empty response (model may have only produced thinking blocks)")
+                except Exception as e:
+                    logger.error(f"Pi error: {e}")
+                    await channel.send(f"❌ Error: {e}")
+                    return
+
+            # ── Send response ──
+            if not full_response and not tool_notifications:
+                await channel.send("✅ Done (no output)")
                 return
 
-        # ── Send response ──
-        if not full_response and not tool_notifications:
-            await channel.send("✅ Done (no output)")
-            return
+            if tool_notifications:
+                for note in tool_notifications:
+                    await channel.send(note)
 
-        if tool_notifications:
-            for note in tool_notifications:
-                await channel.send(note)
+            if full_response:
+                max_len = self.config.max_discord_message_length
+                chunks = [full_response[i: i + max_len] for i in range(0, len(full_response), max_len)]
+                for i, chunk in enumerate(chunks):
+                    if i == 0:
+                        await channel.send(chunk)
+                    else:
+                        await channel.send(f"*(continued)*\n{chunk}")
 
-        if full_response:
-            max_len = self.config.max_discord_message_length
-            chunks = [full_response[i: i + max_len] for i in range(0, len(full_response), max_len)]
-            for i, chunk in enumerate(chunks):
-                if i == 0:
-                    await channel.send(chunk)
-                else:
-                    await channel.send(f"*(continued)*\n{chunk}")
-
-        # Cleanup temp files
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            # Cleanup temp files
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     @staticmethod
     def _get_image_metadata(file_path: str, filename: str) -> Optional[str]:
