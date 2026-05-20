@@ -369,8 +369,23 @@ class PiDiscordBot(discord.Client):
                 return
 
             if tool_notifications:
+                # Batch tool notifications into a single compact summary
+                from collections import Counter
+                tool_counts = Counter()
                 for note in tool_notifications:
-                    await channel.send(note)
+                    name = note.replace("🔧 Running `", "").replace("`...", "")
+                    tool_counts[name] += 1
+
+                summary_parts = []
+                for tool, count in tool_counts.most_common():
+                    icon = {"read": "📖", "write": "✏️", "edit": "✂️", "bash": "💻", "ls": "📂", "grep": "🔍", "find": "🔎"}.get(tool, "🔧")
+                    if count == 1:
+                        summary_parts.append(f"{icon} `{tool}`")
+                    else:
+                        summary_parts.append(f"{icon} `{tool}` x{count}")
+
+                summary = "🔧 **Tools used:** " + ", ".join(summary_parts)
+                await channel.send(summary)
 
             if full_response:
                 max_len = self.config.max_discord_message_length
