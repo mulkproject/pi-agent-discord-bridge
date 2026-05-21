@@ -753,7 +753,16 @@ class PiDiscordBot(discord.Client):
         logger.info(f"Session cwd changed: {channel_id} -> {expanded}")
 
     async def _cmd_pwd(self, message: discord.Message, args: str):
-        """Show the current working directory for this session."""
+        """Show the current working directory for this session.
+        
+        If a path is given, also sets the working directory (like !cd).
+        Usage: !pwd              → Show current directory
+               !pwd /some/path   → Set working directory (same as !cd)
+        """
+        if args.strip():
+            # Act as !cd when path is provided
+            await self._cmd_cd(message, args)
+            return
         channel_id = str(message.channel.id)
         cwd = self._channel_cwds.get(channel_id, os.getcwd())
         await message.channel.send(f"📂 Working directory: `{cwd}`")
