@@ -12,3 +12,8 @@ venv/
 
 # Generated screenshots
 *.png
+
+# Persistent state files
+.pi-cwds.json
+.pi-tts.json
+login_screenshot.py
