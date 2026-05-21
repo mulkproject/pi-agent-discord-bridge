@@ -907,16 +907,37 @@ class PiDiscordBot(discord.Client):
 
         def clean_text(raw: str) -> str:
             t = raw
+            # 1. Remove code blocks entirely (```...```)
             t = re.sub(r'```[\s\S]*?```', '', t)
-            t = re.sub(r'`[^`]+`', '', t)
-            t = re.sub(r'\/[\w\-\.\/]+\/\w+[\.\w]*', ' ', t)
+            # 2. Replace inline code with just the text (remove backticks)
+            t = re.sub(r'`([^`]+)`', r'\1', t)
+            # 3. File paths → just the filename (speak naturally)
+            t = re.sub(
+                r'(?:\/[\w\-\.]+)+\/([\w\-\.]+\.[\w]+)',
+                r'\1',
+                t
+            )
+            t = re.sub(r'(?:\/[\w\-\.]+)+\/([\w\-\.]+)', r'\1', t)
+            # 4. Remove URLs entirely
             t = re.sub(r'https?:\/\/[^\s]+', '', t)
+            # 5. Markdown links [text](url) → just text
             t = re.sub(r'\[[^\]]+\]\([^)]+\)', '', t)
+            # 6. Markdown formatting → plain text
             t = re.sub(r'\*\*(.+?)\*\*', r'\1', t)
             t = re.sub(r'\*(.+?)\*', r'\1', t)
             t = re.sub(r'__(.+?)__', r'\1', t)
+            # 7. Remove markdown heading markers (# ## ###)
+            t = re.sub(r'^#{1,6}\s+', '', t, flags=re.MULTILINE)
+            # 8. Remove bare # symbols that aren't in words
+            t = re.sub(r'(?<![\w])#(?![\w])', '', t)
+            # 9. Remove other special chars that TTS chokes on
+            t = re.sub(r'[*_~]', '', t)
+            # 10. Remove excessive whitespace
             t = re.sub(r'\n\s*\n', '\n', t)
             t = re.sub(r' {2,}', ' ', t)
+            # 11. Remove leading/trailing punctuation
+            t = re.sub(r'^[\s\.,;:!?\-]+', '', t)
+            t = re.sub(r'[\s\.,;:!?\-]+$', '', t)
             return t.strip()
 
         speech_text = clean_text(text)
