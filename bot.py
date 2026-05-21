@@ -65,6 +65,8 @@ class PiDiscordBot(discord.Client):
         self._channel_locks: dict[str, asyncio.Lock] = {}
         # Per-channel working directories (like "cd" for pi sessions)
         self._channel_cwds: dict[str, str] = {}
+        # Per-channel TTS toggle (bot reads responses aloud)
+        self._channel_tts: dict[str, bool] = {}
 
     # ── Lifecycle ─────────────────────────────
 
@@ -129,6 +131,30 @@ class PiDiscordBot(discord.Client):
                 await self._route_command(message, cmd)
             return
 
+        # ── Handle voice messages (always on) ──
+        audio_attachment = None
+        for att in message.attachments:
+            if att.content_type and att.content_type.startswith("audio/"):
+                audio_attachment = att
+                break
+
+        if audio_attachment:
+            logger.info(f"Voice message detected: {audio_attachment.filename} ({audio_attachment.size} bytes)")
+            # Download the audio file
+            temp_dir = tempfile.mkdtemp(prefix="pi-voice-")
+            audio_path = os.path.join(temp_dir, audio_attachment.filename)
+            await audio_attachment.save(audio_path)
+            # Transcribe
+            transcribed = await self._transcribe_audio(audio_path)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if transcribed:
+                # Prepend transcription to user's message
+                message.content = f"[Voice message transcribed: \"{transcribed}\"]\n\n{message.content}"
+                logger.info(f"Voice transcribed: {transcribed[:100]}")
+            else:
+                await message.channel.send("🎤 I heard your voice message but couldn't understand it. Please try again or type instead.")
+                return
+
         # ── Handle prompts ──
         if not message.guild:
             # DM
@@ -180,6 +206,7 @@ class PiDiscordBot(discord.Client):
             "cwd": self._cmd_pwd,
             "screenshot": self._cmd_screenshot,
             "ss": self._cmd_screenshot,
+            "tts": self._cmd_tts,
         }
 
         handler = handlers.get(cmd_name)
@@ -441,6 +468,21 @@ class PiDiscordBot(discord.Client):
                     else:
                         await channel.send(f"*(continued)*\n{chunk}")
 
+                # Generate and send TTS voice clip if enabled
+                tts_file = await self._generate_tts(full_response, str(channel.id))
+                if tts_file:
+                    try:
+                        await channel.send(
+                            "🔊 **Voice response:**",
+                            file=discord.File(tts_file, "response.mp3")
+                        )
+                        logger.info("TTS voice clip sent to Discord")
+                    except Exception as e:
+                        logger.error(f"Failed to send TTS: {e}")
+                    finally:
+                        tts_dir = os.path.dirname(tts_file)
+                        shutil.rmtree(tts_dir, ignore_errors=True)
+
             # Cleanup temp files
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -510,6 +552,7 @@ class PiDiscordBot(discord.Client):
             value=(
                 f"`{p}help` — Show this message\n"
                 f"`{p}screenshot <url>` — Take a webpage screenshot\n"
+                f"`{p}tts on/off` — Toggle voice responses\n"
                 f"`{p}model` — List / switch models\n"
                 f"`{p}cd <path>` — Set working directory\n"
                 f"`{p}pwd` — Show current working directory\n"
@@ -739,6 +782,68 @@ class PiDiscordBot(discord.Client):
         except Exception as e:
             await message.channel.send(f"❌ Screenshot failed: {e}")
             logger.error(f"Screenshot error: {e}")
+
+    async def _cmd_tts(self, message: discord.Message, args: str):
+        """Toggle text-to-speech for bot responses.
+        
+        When enabled, every response will also include a voice clip.
+        Usage: !tts on / !tts off
+        """
+        channel_id = str(message.channel.id)
+        action = args.strip().lower()
+
+        if action == "on":
+            self._channel_tts[channel_id] = True
+            await message.channel.send("🔊 **TTS enabled** — responses will include voice clips.")
+            logger.info(f"TTS enabled for channel {channel_id}")
+        elif action == "off":
+            self._channel_tts[channel_id] = False
+            await message.channel.send("🔇 **TTS disabled** — voice clips turned off.")
+            logger.info(f"TTS disabled for channel {channel_id}")
+        else:
+            current = self._channel_tts.get(channel_id, False)
+            status = "on" if current else "off"
+            await message.channel.send(
+                f"🔊 TTS is currently **{status}**.\n"
+                f"Use `{self.config.bot_prefix}tts on` or `{self.config.bot_prefix}tts off` to toggle."
+            )
+
+    async def _generate_tts(self, text: str, channel_id: str) -> Optional[str]:
+        """Generate TTS audio file from text using edge-tts. Returns file path or None."""
+        if not text or not self._channel_tts.get(channel_id, False):
+            return None
+        try:
+            import edge_tts
+            temp_dir = tempfile.mkdtemp(prefix="pi-tts-")
+            output_path = os.path.join(temp_dir, "response.mp3")
+            communicate = edge_tts.Communicate(text[:500], voice="en-US-AriaNeural")
+            await communicate.save(output_path)
+            if os.path.exists(output_path):
+                logger.info(f"TTS generated: {len(text)} chars -> {output_path}")
+                return output_path
+        except Exception as e:
+            logger.error(f"TTS generation failed: {e}")
+        return None
+
+    async def _transcribe_audio(self, audio_path: str) -> Optional[str]:
+        """Transcribe audio file to text using SpeechRecognition."""
+        try:
+            import speech_recognition as sr
+            r = sr.Recognizer()
+            with sr.AudioFile(audio_path) as source:
+                audio_data = r.record(source)
+            text = r.recognize_google(audio_data)
+            logger.info(f"Transcribed audio ({os.path.getsize(audio_path)} bytes): {text[:80]}...")
+            return text
+        except sr.UnknownValueError:
+            logger.warning("Could not understand audio")
+            return None
+        except sr.RequestError as e:
+            logger.error(f"STT API error: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Audio transcription failed: {e}")
+            return None
 
     async def _cmd_model(self, message: discord.Message, args: str):
         """List available models or switch to a specific one."""
