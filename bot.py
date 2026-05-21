@@ -928,9 +928,12 @@ class PiDiscordBot(discord.Client):
             t = re.sub(r'^#{1,6}\s+', '', t, flags=re.MULTILINE)
             # 8. Remove bare # symbols that aren't in words
             t = re.sub(r'(?<![\w])#(?![\w])', '', t)
-            # 9. Remove other special chars that TTS chokes on
-            t = re.sub(r'[*_~=|]', '', t)
-            # 10. Remove excessive whitespace
+            # 9. Remove emoji and special Unicode characters 
+            #    (emoji range: U+1F300-U+1F9FF, U+200D, etc.)
+            t = re.sub(r'[\U0001F300-\U0001F9FF\U0001F600-\U0001F64F\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U000024C2-\U0001F251\U0001F900-\U0001F9FF\U0000200D\U0000FE0F]', '', t)
+            t = re.sub(r'[\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000026FF\U00002700-\U000027BF]', '', t)
+            # 10. Remove other special chars that TTS chokes on
+            t = re.sub(r'[*_~=|^<>]', '', t)
             t = re.sub(r'\n\s*\n', '\n', t)
             t = re.sub(r' {2,}', ' ', t)
             return t.strip()
@@ -960,6 +963,8 @@ class PiDiscordBot(discord.Client):
                 return None
 
             voice = PiperVoice.load(model_path)
+            # Log what TTS is actually speaking (for debugging)
+            logger.info(f"TTS speaking ({len(speech_text)} chars): {speech_text[:200]}")
             audio_bytes = b""
             sample_rate = 22050
             for chunk in voice.synthesize(speech_text):
