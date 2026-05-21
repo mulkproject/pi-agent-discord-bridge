@@ -23,6 +23,9 @@ import discord
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Bot directory root
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 from config import BotConfig, create_default_config
 from pi_rpc_client import (
     PiRpcClient,
@@ -67,12 +70,15 @@ class PiDiscordBot(discord.Client):
         self._channel_cwds: dict[str, str] = {}
         # Per-channel TTS toggle (bot reads responses aloud)
         self._channel_tts: dict[str, bool] = {}
+        # CWD persistence file path
+        self._cwd_file = os.path.join(BOT_DIR, ".pi-cwds.json")
 
     # ── Lifecycle ─────────────────────────────
 
     async def on_ready(self):
         """Called when the bot is fully connected to Discord."""
         self.session_manager.start()
+        self._load_cwds()
         await self.change_presence(
             activity=discord.Game(name=self.config.bot_status_message)
         )
@@ -114,6 +120,28 @@ class PiDiscordBot(discord.Client):
         if channel_id not in self._channel_locks:
             self._channel_locks[channel_id] = asyncio.Lock()
         return self._channel_locks[channel_id]
+
+    def _save_cwds(self):
+        """Persist working directories to disk so they survive restarts."""
+        try:
+            import json
+            with open(self._cwd_file, "w") as f:
+                json.dump(self._channel_cwds, f, indent=2)
+            logger.info(f"Saved {len(self._channel_cwds)} working dir(s) to {self._cwd_file}")
+        except Exception as e:
+            logger.error(f"Failed to save cwds: {e}")
+
+    def _load_cwds(self):
+        """Load persisted working directories from disk."""
+        try:
+            import json
+            if os.path.exists(self._cwd_file):
+                with open(self._cwd_file) as f:
+                    loaded = json.load(f)
+                self._channel_cwds.update(loaded)
+                logger.info(f"Loaded {len(loaded)} working dir(s) from {self._cwd_file}")
+        except Exception as e:
+            logger.error(f"Failed to load cwds: {e}")
 
     # ── Message Handler ───────────────────────
 
@@ -322,6 +350,8 @@ class PiDiscordBot(discord.Client):
             # ── Send to pi ──
             session = self.session_manager.get_or_create(channel_id, cwd=cwd)
             pi = session.client
+            if cwd:
+                logger.info(f"Session using cwd: {cwd} (channel: {channel_id})")
 
             async with channel.typing():
                 full_response = ""
@@ -714,6 +744,7 @@ class PiDiscordBot(discord.Client):
 
         channel_id = str(message.channel.id)
         self._channel_cwds[channel_id] = expanded
+        self._save_cwds()  # Persist so it survives restarts
 
         # Kill existing session so it restarts with new cwd
         self.session_manager.remove(channel_id)
@@ -891,6 +922,8 @@ class PiDiscordBot(discord.Client):
         try:
             session = self.session_manager.get_or_create(channel_id, cwd=cwd)
             pi = session.client
+            if cwd:
+                logger.info(f"Session using cwd: {cwd} (channel: {channel_id})")
         except Exception as e:
             await channel.send(f"❌ Error: {e}")
             return

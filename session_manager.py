@@ -103,6 +103,8 @@ class SessionManager:
                 cwd=cwd,
             )
             session.start()
+            if cwd:
+                logger.info(f"Pi subprocess will start in: {cwd}")
             session.touch()
             self._sessions[channel_id] = session
             return session
