@@ -72,6 +72,8 @@ class PiDiscordBot(discord.Client):
         self._channel_tts: dict[str, bool] = {}
         # CWD persistence file path
         self._cwd_file = os.path.join(BOT_DIR, ".pi-cwds.json")
+        # TTS persistence file path
+        self._tts_file = os.path.join(BOT_DIR, ".pi-tts.json")
 
     # ── Lifecycle ─────────────────────────────
 
@@ -121,6 +123,17 @@ class PiDiscordBot(discord.Client):
             self._channel_locks[channel_id] = asyncio.Lock()
         return self._channel_locks[channel_id]
 
+    def _save_tts(self):
+        """Persist TTS state to disk so it survives restarts."""
+        try:
+            import json
+            filtered = {k: v for k, v in self._channel_tts.items() if v}  # Only save "on" channels
+            with open(self._tts_file, "w") as f:
+                json.dump(filtered, f, indent=2)
+            logger.info(f"Saved TTS state for {len(filtered)} channel(s)")
+        except Exception as e:
+            logger.error(f"Failed to save TTS state: {e}")
+
     def _save_cwds(self):
         """Persist working directories to disk so they survive restarts."""
         try:
@@ -142,6 +155,18 @@ class PiDiscordBot(discord.Client):
                 logger.info(f"Loaded {len(loaded)} working dir(s) from {self._cwd_file}")
         except Exception as e:
             logger.error(f"Failed to load cwds: {e}")
+        # Also load TTS state
+        try:
+            if os.path.exists(self._tts_file):
+                with open(self._tts_file) as f:
+                    loaded_tts = json.load(f)
+                # Convert string keys back to bool values
+                for k, v in loaded_tts.items():
+                    if isinstance(v, bool):
+                        self._channel_tts[k] = v
+                logger.info(f"Loaded TTS state for {len(loaded_tts)} channel(s) from {self._tts_file}")
+        except Exception as e:
+            logger.error(f"Failed to load TTS state: {e}")
 
     # ── Message Handler ───────────────────────
 
@@ -850,10 +875,12 @@ class PiDiscordBot(discord.Client):
 
         if action == "on":
             self._channel_tts[channel_id] = True
+            self._save_tts()
             await message.channel.send("🔊 **TTS enabled** — responses will include voice clips.")
             logger.info(f"TTS enabled for channel {channel_id}")
         elif action == "off":
             self._channel_tts[channel_id] = False
+            self._save_tts()
             await message.channel.send("🔇 **TTS disabled** — voice clips turned off.")
             logger.info(f"TTS disabled for channel {channel_id}")
         else:
