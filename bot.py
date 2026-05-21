@@ -809,17 +809,55 @@ class PiDiscordBot(discord.Client):
             )
 
     async def _generate_tts(self, text: str, channel_id: str) -> Optional[str]:
-        """Generate TTS audio file from text using edge-tts. Returns file path or None."""
+        """Generate TTS audio file from text using edge-tts. Returns file path or None.
+        
+        Strips code blocks, file paths, URLs, and special characters before TTS
+        so only natural speech is spoken aloud.
+        """
         if not text or not self._channel_tts.get(channel_id, False):
             return None
         try:
+            import re
             import edge_tts
+
+            # Clean text for speech: strip code blocks, paths, URLs, special chars
+            speech_text = text
+
+            # 1. Remove code blocks (```...```)
+            speech_text = re.sub(r'```[\s\S]*?```', '', speech_text)
+
+            # 2. Remove inline code (`...`)
+            speech_text = re.sub(r'`[^`]+`', '', speech_text)
+
+            # 3. Remove file paths (/tmp/foo/bar, /home/..., ./path, etc.)
+            speech_text = re.sub(r'\/[\w\-\.\/]+\/\w+[\.\w]*', ' ', speech_text)
+
+            # 4. Remove URLs (https://..., http://...)
+            speech_text = re.sub(r'https?:\/\/[^\s]+', '', speech_text)
+
+            # 5. Remove markdown links [text](url)
+            speech_text = re.sub(r'\[[^\]]+\]\([^)]+\)', '', speech_text)
+
+            # 6. Replace markdown bold/italic with just the text
+            speech_text = re.sub(r'\*\*(.+?)\*\*', r'\1', speech_text)
+            speech_text = re.sub(r'\*(.+?)\*', r'\1', speech_text)
+            speech_text = re.sub(r'__(.+?)__', r'\1', speech_text)
+
+            # 7. Remove excessive whitespace
+            speech_text = re.sub(r'\n\s*\n', '\n', speech_text)
+            speech_text = re.sub(r' {2,}', ' ', speech_text)
+
+            # 8. Truncate to reasonable length and strip
+            speech_text = speech_text.strip()[:800]
+            if not speech_text:
+                return None
+
             temp_dir = tempfile.mkdtemp(prefix="pi-tts-")
             output_path = os.path.join(temp_dir, "response.mp3")
-            communicate = edge_tts.Communicate(text[:500], voice="en-US-AriaNeural")
+            communicate = edge_tts.Communicate(speech_text, voice="en-US-AriaNeural")
             await communicate.save(output_path)
             if os.path.exists(output_path):
-                logger.info(f"TTS generated: {len(text)} chars -> {output_path}")
+                logger.info(f"TTS generated: {len(speech_text)} chars (was {len(text)}) -> {output_path}")
                 return output_path
         except Exception as e:
             logger.error(f"TTS generation failed: {e}")
