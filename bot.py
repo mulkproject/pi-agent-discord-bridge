@@ -868,7 +868,8 @@ class PiDiscordBot(discord.Client):
         """Generate TTS audio file from text using edge-tts. Returns file path or None.
         
         Strips code blocks, file paths, URLs, and special characters before TTS
-        so only natural speech is spoken aloud.
+        so only natural speech is spoken aloud. For long responses, takes the
+        first meaningful portion and generates a summary-like audio clip.
         """
         if not text or not self._channel_tts.get(channel_id, False):
             return None
@@ -902,19 +903,36 @@ class PiDiscordBot(discord.Client):
             # 7. Remove excessive whitespace
             speech_text = re.sub(r'\n\s*\n', '\n', speech_text)
             speech_text = re.sub(r' {2,}', ' ', speech_text)
-
-            # 8. Truncate to reasonable length and strip
-            speech_text = speech_text.strip()[:800]
+            speech_text = speech_text.strip()
+            
+            # 8. If text is very long, take first meaningful portion + summary note
             if not speech_text:
+                logger.warning("TTS: text was empty after cleaning")
                 return None
+                
+            if len(speech_text) > 2000:
+                # Take first ~1500 chars (meaningful content)
+                speech_text = speech_text[:1500]
+                # Try to end at a sentence boundary
+                last_period = max(speech_text.rfind('.'), speech_text.rfind('!'), speech_text.rfind('?'))
+                if last_period > 500:
+                    speech_text = speech_text[:last_period + 1]
+                speech_text += " The full response is available in the chat."
+                logger.info(f"TTS: truncated long response to {len(speech_text)} chars")
+            
+            # 9. If still too long for edge-tts, take first paragraph
+            if len(speech_text) > 3000:
+                speech_text = speech_text[:3000]
 
             temp_dir = tempfile.mkdtemp(prefix="pi-tts-")
             output_path = os.path.join(temp_dir, "response.mp3")
             communicate = edge_tts.Communicate(speech_text, voice="en-US-AriaNeural")
             await communicate.save(output_path)
-            if os.path.exists(output_path):
-                logger.info(f"TTS generated: {len(speech_text)} chars (was {len(text)}) -> {output_path}")
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 100:
+                logger.info(f"TTS generated: {len(speech_text)} chars (was {len(text)}) -> {os.path.getsize(output_path)} bytes")
                 return output_path
+            else:
+                logger.warning(f"TTS output too small or missing: {output_path}")
         except Exception as e:
             logger.error(f"TTS generation failed: {e}")
         return None
