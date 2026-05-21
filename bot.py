@@ -892,76 +892,78 @@ class PiDiscordBot(discord.Client):
             )
 
     async def _generate_tts(self, text: str, channel_id: str) -> Optional[str]:
-        """Generate TTS audio file from text using edge-tts. Returns file path or None.
+        """Generate TTS audio file from text using Piper TTS (offline, fast, neural).
         
-        Strips code blocks, file paths, URLs, and special characters before TTS
-        so only natural speech is spoken aloud. For long responses, takes the
-        first meaningful portion and generates a summary-like audio clip.
+        Returns file path or None. Strips code blocks, file paths, URLs, and 
+        special characters before TTS so only natural speech is spoken aloud.
+        For long responses, takes the first meaningful portion.
         """
         if not text or not self._channel_tts.get(channel_id, False):
             return None
+
+        import re
+        import wave
+        from piper import PiperVoice
+
+        def clean_text(raw: str) -> str:
+            t = raw
+            t = re.sub(r'```[\s\S]*?```', '', t)
+            t = re.sub(r'`[^`]+`', '', t)
+            t = re.sub(r'\/[\w\-\.\/]+\/\w+[\.\w]*', ' ', t)
+            t = re.sub(r'https?:\/\/[^\s]+', '', t)
+            t = re.sub(r'\[[^\]]+\]\([^)]+\)', '', t)
+            t = re.sub(r'\*\*(.+?)\*\*', r'\1', t)
+            t = re.sub(r'\*(.+?)\*', r'\1', t)
+            t = re.sub(r'__(.+?)__', r'\1', t)
+            t = re.sub(r'\n\s*\n', '\n', t)
+            t = re.sub(r' {2,}', ' ', t)
+            return t.strip()
+
+        speech_text = clean_text(text)
+        if not speech_text:
+            logger.warning("TTS: text empty after cleaning")
+            return None
+
+        # Truncate long responses
+        if len(speech_text) > 1500:
+            speech_text = speech_text[:1500]
+            for sep in ('.', '!', '?'):
+                pos = speech_text.rfind(sep)
+                if pos > 500:
+                    speech_text = speech_text[:pos + 1]
+                    break
+            speech_text += " The full response is in the chat."
+            logger.info(f"TTS truncated: {len(speech_text)} chars")
+
+        temp_dir = tempfile.mkdtemp(prefix="pi-tts-")
         try:
-            import re
-            import edge_tts
-
-            # Clean text for speech: strip code blocks, paths, URLs, special chars
-            speech_text = text
-
-            # 1. Remove code blocks (```...```)
-            speech_text = re.sub(r'```[\s\S]*?```', '', speech_text)
-
-            # 2. Remove inline code (`...`)
-            speech_text = re.sub(r'`[^`]+`', '', speech_text)
-
-            # 3. Remove file paths (/tmp/foo/bar, /home/..., ./path, etc.)
-            speech_text = re.sub(r'\/[\w\-\.\/]+\/\w+[\.\w]*', ' ', speech_text)
-
-            # 4. Remove URLs (https://..., http://...)
-            speech_text = re.sub(r'https?:\/\/[^\s]+', '', speech_text)
-
-            # 5. Remove markdown links [text](url)
-            speech_text = re.sub(r'\[[^\]]+\]\([^)]+\)', '', speech_text)
-
-            # 6. Replace markdown bold/italic with just the text
-            speech_text = re.sub(r'\*\*(.+?)\*\*', r'\1', speech_text)
-            speech_text = re.sub(r'\*(.+?)\*', r'\1', speech_text)
-            speech_text = re.sub(r'__(.+?)__', r'\1', speech_text)
-
-            # 7. Remove excessive whitespace
-            speech_text = re.sub(r'\n\s*\n', '\n', speech_text)
-            speech_text = re.sub(r' {2,}', ' ', speech_text)
-            speech_text = speech_text.strip()
-            
-            # 8. If text is very long, take first meaningful portion + summary note
-            if not speech_text:
-                logger.warning("TTS: text was empty after cleaning")
+            model_path = os.path.expanduser("~/.piper-voices/en_US-lessac-medium.onnx")
+            if not os.path.exists(model_path):
+                logger.warning(f"Piper model not found at {model_path}")
+                shutil.rmtree(temp_dir, ignore_errors=True)
                 return None
-                
-            if len(speech_text) > 2000:
-                # Take first ~1500 chars (meaningful content)
-                speech_text = speech_text[:1500]
-                # Try to end at a sentence boundary
-                last_period = max(speech_text.rfind('.'), speech_text.rfind('!'), speech_text.rfind('?'))
-                if last_period > 500:
-                    speech_text = speech_text[:last_period + 1]
-                speech_text += " The full response is available in the chat."
-                logger.info(f"TTS: truncated long response to {len(speech_text)} chars")
-            
-            # 9. If still too long for edge-tts, take first paragraph
-            if len(speech_text) > 3000:
-                speech_text = speech_text[:3000]
 
-            temp_dir = tempfile.mkdtemp(prefix="pi-tts-")
-            output_path = os.path.join(temp_dir, "response.mp3")
-            communicate = edge_tts.Communicate(speech_text, voice="en-US-AriaNeural")
-            await communicate.save(output_path)
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 100:
-                logger.info(f"TTS generated: {len(speech_text)} chars (was {len(text)}) -> {os.path.getsize(output_path)} bytes")
+            voice = PiperVoice.load(model_path)
+            audio_bytes = b""
+            sample_rate = 22050
+            for chunk in voice.synthesize(speech_text):
+                audio_bytes += chunk.audio_int16_bytes
+                sample_rate = getattr(chunk, 'sample_rate', sample_rate)
+
+            output_path = os.path.join(temp_dir, "response.wav")
+            with wave.open(output_path, "w") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(sample_rate)
+                wav.writeframes(audio_bytes)
+
+            if os.path.getsize(output_path) > 500:
+                logger.info(f"Piper TTS: {len(speech_text)} chars -> {os.path.getsize(output_path)} bytes")
                 return output_path
-            else:
-                logger.warning(f"TTS output too small or missing: {output_path}")
         except Exception as e:
-            logger.error(f"TTS generation failed: {e}")
+            logger.error(f"Piper TTS failed: {e}")
+
+        shutil.rmtree(temp_dir, ignore_errors=True)
         return None
 
     async def _transcribe_audio(self, audio_path: str) -> Optional[str]:
