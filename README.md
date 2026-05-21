@@ -167,6 +167,7 @@ sudo bash pi-discord-manager.sh autostart
 | Command | Description |
 |---------|-------------|
 | `!help` | Show all commands |
+| `!tts on/off` | Toggle voice responses (bot reads replies aloud) |
 | `!screenshot <url>` | Take a webpage screenshot (alias: `!ss`) |
 | `!model` | List available pi models |
 | `!model <name>` | Switch to a specific model (e.g., `!model kimi-k2.5`) |
