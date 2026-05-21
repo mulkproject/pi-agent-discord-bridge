@@ -189,6 +189,10 @@ class PiDiscordBot(discord.Client):
             if not self._is_allowed_user(message.author.id):
                 logger.info(f"Denied DM: user {message.author.id} not allowed")
                 return
+            try:
+                await message.add_reaction("👀")
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                pass
             await self._handle_prompt(message)
             return
 
@@ -206,6 +210,12 @@ class PiDiscordBot(discord.Client):
         if not self._is_allowed_guild(message.guild.id):
             logger.info(f"Denied: guild {message.guild.id} not allowed")
             return
+
+        # Add "seen" reaction so user knows bot received the message
+        try:
+            await message.add_reaction("👀")
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
 
         await self._handle_prompt(message)
 
@@ -236,6 +246,12 @@ class PiDiscordBot(discord.Client):
             "ss": self._cmd_screenshot,
             "tts": self._cmd_tts,
         }
+
+        # Acknowledge command
+        try:
+            await message.add_reaction("⚡")
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
 
         handler = handlers.get(cmd_name)
         if handler:
