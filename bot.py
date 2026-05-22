@@ -475,6 +475,28 @@ class PiDiscordBot(discord.Client):
                     await channel.send(f"❌ Error: {e}")
                     return
 
+            # ── Handle empty response when image was attached ──
+            if not full_response and rpc_images:
+                logger.info("Empty response with image - model may not support vision")
+                # Try once more without the image, just describing it
+                def run_retry():
+                    return pi.prompt_sync(
+                        prompt_text + "\n\n(Note: An image was attached above. "
+                        "If you cannot see it, describe what you would do with the file path instead.)",
+                        timeout=300,
+                        on_delta=on_delta,
+                        on_tool=on_tool_start,
+                    )
+                retry_text = await loop.run_in_executor(None, run_retry)
+                if retry_text:
+                    full_response = retry_text
+                    logger.info(f"Retry with text-only got {len(retry_text)} chars")
+                else:
+                    await channel.send(
+                        "📷 Image received but the current model cannot analyze images visually.\n"
+                        f"Try switching to a vision model: `{self.config.bot_prefix}model kimi-k2.5`"
+                    )
+
             # ── Check for screenshot files created by pi ──
             screenshot_files = []
             if temp_dir:
