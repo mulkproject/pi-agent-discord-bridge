@@ -270,6 +270,8 @@ class PiDiscordBot(discord.Client):
             "screenshot": self._cmd_screenshot,
             "ss": self._cmd_screenshot,
             "tts": self._cmd_tts,
+            "audiobook": self._cmd_audiobook,
+            "book": self._cmd_audiobook,
         }
 
         # Acknowledge command
@@ -624,6 +626,7 @@ class PiDiscordBot(discord.Client):
                 f"`{p}help` — Show this message\n"
                 f"`{p}screenshot <url>` — Take a webpage screenshot\n"
                 f"`{p}tts on/off` — Toggle voice responses\n"
+                f"`{p}audiobook <url>` — Generate an audiobook from a URL or file\n"
                 f"`{p}model` — List / switch models\n"
                 f"`{p}cd <path>` — Set working directory\n"
                 f"`{p}pwd` — Show current working directory\n"
@@ -891,6 +894,330 @@ class PiDiscordBot(discord.Client):
                 f"Use `{self.config.bot_prefix}tts on` or `{self.config.bot_prefix}tts off` to toggle."
             )
 
+    async def _cmd_audiobook(self, message: discord.Message, args: str):
+        """Generate an audiobook from a URL or file attachment.
+
+        Fetches text from URLs (Project Gutenberg, plain text pages),
+        or reads attached .txt/.md files, splits into chapters, and
+        generates audio files using Piper TTS.
+
+        Usage: !audiobook https://www.gutenberg.org/ebooks/1342.txt.utf-8
+               !audiobook (with .txt attachment)
+        """
+        channel = message.channel
+        url = args.strip()
+        temp_dir = tempfile.mkdtemp(prefix="pi-audiobook-")
+
+        try:
+            # ── 1. Get the text source ──
+            text_content = None
+            source_name = ""
+
+            # Check for attachments first
+            if message.attachments:
+                att = message.attachments[0]
+                if any(att.filename.lower().endswith(ext) for ext in ('.txt', '.md', '.html', '.htm')):
+                    await channel.send(f"📖 Processing attachment: `{att.filename}`...")
+                    data = await att.read()
+                    text_content = data.decode('utf-8', errors='replace')
+                    source_name = os.path.splitext(att.filename)[0]
+                else:
+                    await channel.send("❌ Unsupported file type. Please attach `.txt` or `.md` files.")
+                    return
+
+            # Handle URL
+            elif url and (url.startswith(('http://', 'https://'))):
+                status_msg = await channel.send(f"🌐 Fetching text from `{url}`...")
+                text_content = await self._fetch_book_text(url)
+                if text_content:
+                    source_name = url.rstrip('/').split('/')[-1]
+                    source_name = source_name.replace('-', ' ').replace('_', ' ').replace('.htm', '').replace('.html', '').replace('.txt', '').replace('.utf-8', '').replace('.utf8', '')
+                    await status_msg.edit(content=f"✅ Fetched {len(text_content):,} characters from `{url}`")
+                else:
+                    await channel.send("❌ Failed to fetch text from that URL. Make sure it's a plain text or HTML page.")
+                    return
+            else:
+                await channel.send(
+                    f"❌ Usage: `{self.config.bot_prefix}audiobook <url>`\n"
+                    f"   Or attach a `.txt` / `.md` file.\n\n"
+                    f"   Examples:\n"
+                    f"   • `{self.config.bot_prefix}audiobook https://www.gutenberg.org/ebooks/1342.txt.utf-8`\n"
+                    f"   • Attach a .txt file and type `{self.config.bot_prefix}audiobook`"
+                )
+                return
+
+            if not text_content or len(text_content.strip()) < 50:
+                await channel.send("❌ Text content is too short or empty. Please provide a longer text.")
+                return
+
+            # ── 2. Split text into chapters ──
+            chapters = self._split_into_chapters(text_content, source_name)
+
+            if not chapters:
+                # No chapter markers found - treat as single chapter
+                chapters = [(source_name or "Book", text_content)]
+
+            # Limit to reasonable number of chapters
+            max_chapters = 20
+            if len(chapters) > max_chapters:
+                await channel.send(f"⚠️ Book has {len(chapters)} chapters, generating first {max_chapters}.")
+                chapters = chapters[:max_chapters]
+
+            await channel.send(f"📚 Found **{len(chapters)}** chapter(s). Generating audio...")
+
+            # ── 3. Generate audio for each chapter ──
+            model_path = os.path.expanduser("~/.piper-voices/en_US-lessac-medium.onnx")
+            if not os.path.exists(model_path):
+                await channel.send("❌ Piper TTS model not found. Run: python3 -m piper.download en_US-lessac-medium")
+                return
+
+            from piper import PiperVoice
+            voice = PiperVoice.load(model_path)
+
+            audio_files = []
+            for i, (title, chapter_text) in enumerate(chapters, 1):
+                progress_msg = await channel.send(f"🎵 Generating audio: Chapter {i}/{len(chapters)} — `{title}`...")
+
+                clean_chapter = self._clean_audiobook_text(chapter_text)
+                if not clean_chapter or len(clean_chapter) < 20:
+                    await progress_msg.edit(content=f"⏭️ Chapter {i} (`{title}`) is too short, skipping.")
+                    continue
+
+                # Piper handles ~5000 chars well; split longer chapters
+                max_chunk = 5000
+                chapter_audio_path = os.path.join(temp_dir, f"chapter_{i:03d}.wav")
+
+                if len(clean_chapter) > max_chunk:
+                    parts = []
+                    for j in range(0, len(clean_chapter), max_chunk):
+                        part_text = clean_chapter[j:j + max_chunk]
+                        # Break at sentence boundary
+                        for sep in ('.', '!', '?'):
+                            pos = part_text.rfind(sep)
+                            if pos > max_chunk // 2:
+                                part_text = part_text[:pos + 1]
+                                break
+                        parts.append(part_text)
+                    self._merge_tts_chunks(voice, parts, chapter_audio_path)
+                else:
+                    self._generate_tts_file(voice, clean_chapter, chapter_audio_path)
+
+                if os.path.exists(chapter_audio_path) and os.path.getsize(chapter_audio_path) > 500:
+                    audio_files.append((i, title, chapter_audio_path))
+                    await progress_msg.edit(content=f"✅ Chapter {i}: `{title}` — {os.path.getsize(chapter_audio_path) // 1024} KB")
+                else:
+                    await progress_msg.edit(content=f"❌ Chapter {i} (`{title}`) failed to generate.")
+
+            # ── 4. Send audio files to Discord ──
+            if not audio_files:
+                await channel.send("❌ No audio files were generated.")
+                return
+
+            total_size = sum(os.path.getsize(p) for _, _, p in audio_files)
+            await channel.send(f"🎧 **Audiobook generated!** {len(audio_files)} chapter(s), {total_size // (1024 * 1024)} MB total. Sending files...")
+
+            for idx, title, fpath in audio_files:
+                size_kb = os.path.getsize(fpath) // 1024
+                # Try to convert WAV to MP3 for smaller size (non-blocking, best-effort)
+                mp3_path = fpath.replace('.wav', '.mp3')
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        ['ffmpeg', '-y', '-i', fpath, '-codec:a', 'libmp3lame', '-qscale:a', '5', mp3_path],
+                        capture_output=True, timeout=120
+                    )
+                    if result.returncode == 0 and os.path.exists(mp3_path):
+                        send_path = mp3_path
+                        send_name = f"chapter_{idx:03d}.mp3"
+                    else:
+                        send_path = fpath
+                        send_name = f"chapter_{idx:03d}.wav"
+                except Exception:
+                    send_path = fpath
+                    send_name = f"chapter_{idx:03d}.wav"
+
+                await channel.send(
+                    f"📖 **Chapter {idx}:** {title} ({size_kb} KB)",
+                    file=discord.File(send_path, filename=send_name)
+                )
+
+            await channel.send("✅ **Audiobook complete!** Enjoy listening! 🎧")
+
+        except Exception as e:
+            logger.error(f"Audiobook error: {e}", exc_info=True)
+            await channel.send(f"❌ Audiobook generation failed: {e}")
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    async def _fetch_book_text(self, url: str) -> Optional[str]:
+        """Fetch text content from a URL. Handles plain text and HTML pages."""
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status != 200:
+                        logger.error(f"HTTP {response.status} fetching {url}")
+                        return None
+                    content_type = response.headers.get('Content-Type', '')
+                    data = await response.read()
+
+                    # Try UTF-8 first, then fallback to latin-1
+                    try:
+                        text = data.decode('utf-8')
+                    except UnicodeDecodeError:
+                        text = data.decode('latin-1')
+
+                    # Strip HTML if it's an HTML page
+                    if 'text/html' in content_type or url.endswith(('.htm', '.html')):
+                        text = self._strip_html(text)
+
+                    return text.strip()
+        except Exception as e:
+            logger.error(f"Failed to fetch {url}: {e}")
+            return None
+
+    @staticmethod
+    def _strip_html(html: str) -> str:
+        """Strip HTML tags and extract readable text."""
+        import re
+        # Remove scripts and styles
+        html = re.sub(r'<script[^>]*?>[\s\S]*?</script>', '', html, flags=re.IGNORECASE)
+        html = re.sub(r'<style[^>]*?>[\s\S]*?</style>', '', html, flags=re.IGNORECASE)
+        # Remove all HTML tags
+        text = re.sub(r'<[^>]+>', ' ', html)
+        # Decode common HTML entities
+        text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+        text = text.replace('&quot;', '"').replace('&#39;', "'")
+        text = text.replace('&mdash;', '—').replace('&ndash;', '–').replace('&hellip;', '...')
+        # Remove Project Gutenberg header/footer noise
+        lines = text.split('\n')
+        cleaned_lines = []
+        in_gutenberg = False
+        for line in lines:
+            stripped = line.strip()
+            if '*** START OF' in stripped.upper() or '***BEGIN' in stripped.upper():
+                in_gutenberg = True
+                continue
+            if '*** END OF' in stripped.upper() or '***END' in stripped.upper():
+                in_gutenberg = False
+                continue
+            if in_gutenberg or not stripped.startswith('***'):
+                cleaned_lines.append(line)
+        text = '\n'.join(cleaned_lines)
+        # Collapse whitespace
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'\n\s*\n', '\n\n', text)
+        return text.strip()
+
+    @staticmethod
+    def _split_into_chapters(text: str, default_title: str = "Book") -> list:
+        """Split text into chapters based on common chapter heading patterns.
+
+        Returns list of (chapter_title, chapter_text) tuples.
+        Returns empty list if no clear chapter markers found.
+        """
+        import re
+
+        # Common chapter heading patterns (case-insensitive)
+        # 1. "Chapter 1", "CHAPTER 1", "Chapter One", "Chapitre 1", "Kapitel 1"
+        # 2. "Part I", "Part 1", "Section 1", "Book I"
+        # 3. Roman numerals: "I.", "II.", "III." followed by title text
+        # 4. Arabic: "1.", "2." followed by title text
+        patterns = [
+            r'(?:^|\n)\s*(?:Chapter|CHAPTER|Chapitre|Kapitel)\s+[0-9IVXLCDM]+\s*[.:]?\s*[^\n]*',
+            r'(?:^|\n)\s*(?:Part|PART|Section|SECTION|Book|BOOK)\s+[0-9IVXLCDM]+\s*[.:]?\s*[^\n]*',
+            r'(?:^|\n)\s*[IVXLCDM]+\.\s+[A-Z"][^\n]{3,}',
+            r'(?:^|\n)\s*\d+\.\s+[A-Z"][^\n]{3,}',
+        ]
+
+        combined = '|'.join(f'({p})' for p in patterns)
+        matches = list(re.finditer(combined, text, re.MULTILINE))
+
+        if len(matches) < 2:
+            return []
+
+        chapters = []
+        for i, match in enumerate(matches):
+            start = match.start()
+            title = match.group().strip().lstrip('\n').strip()
+            title = re.sub(r'\s+', ' ', title).strip()
+
+            if i + 1 < len(matches):
+                end = matches[i + 1].start()
+            else:
+                end = len(text)
+
+            chapter_text = text[start:end].strip()
+            if chapter_text and len(chapter_text) > 50:
+                chapters.append((title, chapter_text))
+
+        return chapters
+
+    @staticmethod
+    def _clean_audiobook_text(text: str) -> str:
+        """Clean text for TTS audiobook generation.
+        Preserves natural language, removes markdown, URLs, and artifacts.
+        """
+        import re
+        t = text
+        # Remove code blocks
+        t = re.sub(r'```[\s\S]*?```', '', t)
+        # Remove URLs
+        t = re.sub(r'https?://[^\s]+', '', t)
+        # Markdown links [text](url) -> text
+        t = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', t)
+        # Markdown formatting
+        t = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', t)
+        t = re.sub(r'_{1,2}([^_]+)_{1,2}', r'\1', t)
+        # Heading markers
+        t = re.sub(r'^#{1,6}\s+', '', t, flags=re.MULTILINE)
+        # Horizontal rules
+        t = re.sub(r'^[-*_]{3,}\s*$', '', t, flags=re.MULTILINE)
+        # Emoji
+        t = re.sub(r'[\U0001F300-\U0001F9FF\U0001F600-\U0001F64F\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]', '', t)
+        # Project Gutenberg artifacts
+        t = re.sub(r'\*\*\*.*?\*\*\*', '', t)
+        t = re.sub(r'_+', '', t)
+        # Collapse blank lines
+        t = re.sub(r'\n{3,}', '\n\n', t)
+        t = re.sub(r' {2,}', ' ', t)
+        # Remove leading/trailing whitespace per line
+        lines = [l.strip() for l in t.split('\n')]
+        t = '\n'.join(l for l in lines if l)
+        return t.strip()
+
+    @staticmethod
+    def _generate_tts_file(voice, text: str, output_path: str):
+        """Generate a TTS audio WAV file from text using a loaded Piper voice."""
+        import wave
+        audio_bytes = b""
+        sample_rate = 22050
+        for chunk in voice.synthesize(text):
+            audio_bytes += chunk.audio_int16_bytes
+            sample_rate = getattr(chunk, 'sample_rate', sample_rate)
+        with wave.open(output_path, "w") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes(audio_bytes)
+
+    @staticmethod
+    def _merge_tts_chunks(voice, chunks: list[str], output_path: str):
+        """Generate TTS from multiple text chunks and merge into one WAV file."""
+        import wave
+        full_audio = b""
+        final_sr = 22050
+        for chunk in chunks:
+            for part in voice.synthesize(chunk):
+                full_audio += part.audio_int16_bytes
+                final_sr = getattr(part, 'sample_rate', final_sr)
+        with wave.open(output_path, "w") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(final_sr)
+            wav.writeframes(full_audio)
+
     async def _generate_tts(self, text: str, channel_id: str) -> Optional[str]:
         """Generate TTS audio file from text using Piper TTS (offline, fast, neural).
         
@@ -1010,6 +1337,8 @@ class PiDiscordBot(discord.Client):
     async def _cmd_model(self, message: discord.Message, args: str):
         """List available models or switch to a specific one."""
         channel = message.channel
+        channel_id = str(channel.id)
+        cwd = self._channel_cwds.get(channel_id)
 
         # Get or create session
         try:
