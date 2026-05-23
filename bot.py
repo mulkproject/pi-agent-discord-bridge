@@ -1018,14 +1018,36 @@ class PiDiscordBot(discord.Client):
         return None
 
     async def _transcribe_audio(self, audio_path: str) -> Optional[str]:
-        """Transcribe audio file to text using SpeechRecognition."""
+        """Transcribe audio file to text using SpeechRecognition.
+        
+        Handles OGG (Discord voice messages) by converting to WAV first via ffmpeg.
+        """
         try:
             import speech_recognition as sr
+
+            # Discord sends voice messages as .ogg (Opus) — convert to WAV first
+            wav_path = audio_path
+            if audio_path.endswith('.ogg'):
+                wav_path = audio_path + '.wav'
+                subprocess.run(
+                    ['ffmpeg', '-y', '-i', audio_path, '-acodec', 'pcm_s16le',
+                     '-ar', '16000', '-ac', '1', wav_path],
+                    capture_output=True, timeout=30
+                )
+                if not os.path.exists(wav_path):
+                    logger.error("FFmpeg conversion failed")
+                    return None
+
             r = sr.Recognizer()
-            with sr.AudioFile(audio_path) as source:
+            with sr.AudioFile(wav_path) as source:
                 audio_data = r.record(source)
             text = r.recognize_google(audio_data)
-            logger.info(f"Transcribed audio ({os.path.getsize(audio_path)} bytes): {text[:80]}...")
+
+            # Clean up temp WAV
+            if wav_path != audio_path:
+                os.unlink(wav_path)
+
+            logger.info(f"Transcribed ({os.path.getsize(audio_path)} bytes): {text[:80]}...")
             return text
         except sr.UnknownValueError:
             logger.warning("Could not understand audio")
