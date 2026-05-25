@@ -519,8 +519,19 @@ class PiDiscordBot(discord.Client):
             screenshot_files = list(set(screenshot_files))[:3]  # Max 3
 
             # ── Send response ──
+            # All response is empty (no text, no tools, no screenshots)
             if not full_response and not tool_notifications and not screenshot_files:
-                await channel.send("✅ Done (no output)")
+                # Likely the model only produced thinking blocks or the session is broken
+                await channel.send(
+                    "⚠️ The agent finished but produced **no output**.\n"
+                    "This can happen if the model only generates internal thinking, "
+                    "or the session failed to start correctly.\n"
+                    "Try:\n"
+                    "• Switch to a different model: `!model kimi-k2.5` (for vision) or `!model deepseek` (for text)\n"
+                    "• Reset the conversation: `!clear`\n"
+                    "• Wait a moment and try again\n"
+                    "• Check logs with: `tail -f /tmp/pi-discord-bot.log`"
+                )
                 return
 
             if tool_notifications:
